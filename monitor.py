@@ -1,12 +1,12 @@
 """
-Chrome Hearts NY (West Village) appointment watcher — v4.
+Chrome Hearts NY (West Village) appointment watcher — v5.
 
-Screen-aware version. Each step it reads the page and reacts:
-  welcome ("Schedule a booking") -> service ("Personal Shopping")
-  -> party size (picks 1) -> date/time picker.
-On the date/time screen it records enabled calendar days and any
-visible times, then notifies via ntfy.sh when new availability appears.
-Tapping the notification opens the booking page.
+Flow: welcome -> service -> party size -> "Select date and time".
+On the date/time screen: if the page says "No available times for the
+next N days", there's nothing bookable — stop quietly. Otherwise click
+through each day chip (Mon 13 Jul, Tue 14 Jul, ...) and record the
+times that render, e.g. "Mon 13 Jul 11:30 AM". New slots trigger an
+ntfy.sh push; tapping the notification opens the booking page.
 Saves shot-N.png at every step for debugging.
 """
 import json
@@ -30,14 +30,14 @@ STATE_FILE = Path("state.json")
 MAX_STEPS = 8
 
 TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)\b")
-DAY_NUM_RE = re.compile(r"^\s*\d{1,2}\s*$")
-DATE_NAME_RE = re.compile(
-    r"(January|February|March|April|May|June|July|August"
-    r"|September|October|November|December)",
+DAY_CHIP_RE = re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b", re.I)
+NO_AVAIL_RE = re.compile(
+    r"(no available (times|appointments)|no (times|availability|appointments)"
+    r"|fully booked|no slots)",
     re.I,
 )
-NO_AVAIL_RE = re.compile(
-    r"(no (times|availability|appointments)|fully booked|no slots)", re.I
+NO_AVAIL_WINDOW_RE = re.compile(
+    r"no available times for the next \d+ days", re.I
 )
 
 
@@ -94,49 +94,45 @@ def click_regex(page, pattern: str) -> bool:
     return False
 
 
-def scan_calendar(page, page_texts: list, available_days: list) -> None:
-    """Record enabled calendar days, open a few so times render."""
-    candidates = (
-        page.get_by_role("button", name=DAY_NUM_RE),
-        page.get_by_role("gridcell", name=DAY_NUM_RE),
-        page.get_by_role("radio", name=DAY_NUM_RE),
-        page.get_by_role("option", name=DAY_NUM_RE),
-        page.locator("button").filter(has_text=DAY_NUM_RE),
-        page.get_by_role("button", name=DATE_NAME_RE),
-    )
-    clicked = 0
-    for locator in candidates:
+def scan_day_chips(page, page_texts: list, slots: set) -> int:
+    """Click each visible day chip and record 'day + time' slots."""
+    scanned = 0
+    for role in ("button", "tab", "radio", "option"):
+        loc = page.get_by_role(role, name=DAY_CHIP_RE)
         try:
-            count = min(locator.count(), 40)
+            count = min(loc.count(), 14)
         except Exception:
             continue
+        if count == 0:
+            continue
         for i in range(count):
-            el = locator.nth(i)
+            el = loc.nth(i)
             try:
                 if not el.is_visible() or not el.is_enabled():
                     continue
                 if el.get_attribute("aria-disabled") == "true":
                     continue
                 label = (
-                    el.get_attribute("aria-label") or el.inner_text().strip()
-                )
-                if label and label not in available_days:
-                    available_days.append(label)
-                if clicked < 3:
-                    el.click(timeout=2_000)
-                    page.wait_for_timeout(4_000)
-                    page_texts.append(body_text(page))
-                    clicked += 1
+                    el.get_attribute("aria-label") or el.inner_text()
+                ).strip().replace("\n", " ")
+                el.click(timeout=2_000)
+                page.wait_for_timeout(2_500)
+                text = body_text(page)
+                page_texts.append(text)
+                for t in sorted(set(TIME_RE.findall(text))):
+                    slots.add(f"{label} {t}")
+                scanned += 1
             except Exception:
                 continue
-        if available_days:
+        if scanned:
             break
-    print(f"Enabled days seen: {len(available_days)}; opened {clicked}")
+    return scanned
 
 
 def main() -> None:
     page_texts = []
-    available_days = []
+    slots: set = set()
+    fully_booked = False
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -157,9 +153,18 @@ def main() -> None:
             elif "schedule a booking" in low:
                 acted = click_regex(page, r"schedule a booking|schedule|book")
             else:
-                # Unknown screen — assume it's the date/time picker
+                # Date/time screen (or something new — screenshots will show)
                 print(f"Step {n}: treating as date/time screen")
-                scan_calendar(page, page_texts, available_days)
+                if NO_AVAIL_WINDOW_RE.search(text):
+                    fully_booked = True
+                    print("Page says no availability in the whole window")
+                else:
+                    # Something may be open — scan visible days, then the
+                    # next page of days if there's a next arrow
+                    scan_day_chips(page, page_texts, slots)
+                    if click_regex(page, r"next|forward"):
+                        page.wait_for_timeout(2_500)
+                        scan_day_chips(page, page_texts, slots)
                 break
 
             if not acted:
@@ -171,18 +176,12 @@ def main() -> None:
         shot(page, "screenshot.png")
         browser.close()
 
-    dom_times: set = set()
-    for text in page_texts:
-        dom_times.update(TIME_RE.findall(text))
-    slots = set(dom_times) if dom_times else set(available_days)
-
     all_text = "\n".join(page_texts)
     Path("found.json").write_text(
         json.dumps(
             {
-                "dom_times": sorted(dom_times),
-                "available_days": available_days,
                 "slots": sorted(slots),
+                "fully_booked_message": fully_booked,
                 "saw_no_availability_text": bool(NO_AVAIL_RE.search(all_text)),
             },
             indent=2,
@@ -200,11 +199,11 @@ def main() -> None:
     print(f"Found {len(slots)} slot(s); {len(new_slots)} new since last check")
 
     if new_slots:
-        preview = ", ".join(sorted(new_slots)[:6])
-        more = f" (+{len(new_slots) - 6} more)" if len(new_slots) > 6 else ""
+        preview = ", ".join(sorted(new_slots)[:5])
+        more = f" (+{len(new_slots) - 5} more)" if len(new_slots) > 5 else ""
         notify(
             "Chrome Hearts NY: appointment available",
-            f"New availability: {preview}{more}. Tap to book.",
+            f"{preview}{more}. Tap to book.",
         )
 
     STATE_FILE.write_text(json.dumps({"slots": sorted(slots)}, indent=2))
