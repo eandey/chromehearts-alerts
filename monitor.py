@@ -1,12 +1,13 @@
 """
-Chrome Hearts NY (West Village) appointment watcher — v3.
+Chrome Hearts NY (West Village) appointment watcher — v4.
 
-Waitwhile streams availability over Firebase (not plain API calls), so
-this version reads what actually renders on the page: it clicks
-"Schedule a booking" -> the chosen service -> the calendar, then looks
-for bookable times. Enabled calendar days count as availability too.
-Sends a push via ntfy.sh; tapping the notification opens the booking
-page. Saves a screenshot at every step (shot-*.png) for debugging.
+Screen-aware version. Each step it reads the page and reacts:
+  welcome ("Schedule a booking") -> service ("Personal Shopping")
+  -> party size (picks 1) -> date/time picker.
+On the date/time screen it records enabled calendar days and any
+visible times, then notifies via ntfy.sh when new availability appears.
+Tapping the notification opens the booking page.
+Saves shot-N.png at every step for debugging.
 """
 import json
 import os
@@ -22,10 +23,11 @@ BOOKING_URL = os.environ.get(
 CLICK_URL = os.environ.get(
     "CLICK_URL", "https://waitwhile.com/locations/chromehearts"
 )
-# Which service to watch — change to "Product Pickup", "Repair", etc. if needed
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "Personal Shopping")
+PARTY_SIZE = os.environ.get("PARTY_SIZE", "1")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 STATE_FILE = Path("state.json")
+MAX_STEPS = 8
 
 TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)\b")
 DAY_NUM_RE = re.compile(r"^\s*\d{1,2}\s*$")
@@ -66,28 +68,70 @@ def shot(page, name: str) -> None:
         print(f"Screenshot {name} failed: {e}")
 
 
-def click_first_match(page, patterns, roles=("button", "link")) -> bool:
-    """Click the first visible element matching any pattern, by role then text."""
-    for pattern in patterns:
-        rx = re.compile(pattern, re.I)
-        for role in roles:
-            try:
-                el = page.get_by_role(role, name=rx).first
-                if el.is_visible():
-                    el.click(timeout=5_000)
-                    print(f"Clicked {role} matching /{pattern}/")
-                    return True
-            except Exception:
-                continue
+def body_text(page) -> str:
+    try:
+        return page.inner_text("body")
+    except Exception:
+        return ""
+
+
+def click_regex(page, pattern: str) -> bool:
+    """Click the first visible element matching pattern (button, link, or text)."""
+    rx = re.compile(pattern, re.I)
+    for get in (
+        lambda: page.get_by_role("button", name=rx).first,
+        lambda: page.get_by_role("link", name=rx).first,
+        lambda: page.get_by_text(rx).first,
+    ):
         try:
-            el = page.get_by_text(rx).first
+            el = get()
             if el.is_visible():
                 el.click(timeout=5_000)
-                print(f"Clicked text matching /{pattern}/")
+                print(f"Clicked /{pattern}/")
                 return True
         except Exception:
             continue
     return False
+
+
+def scan_calendar(page, page_texts: list, available_days: list) -> None:
+    """Record enabled calendar days, open a few so times render."""
+    candidates = (
+        page.get_by_role("button", name=DAY_NUM_RE),
+        page.get_by_role("gridcell", name=DAY_NUM_RE),
+        page.get_by_role("radio", name=DAY_NUM_RE),
+        page.get_by_role("option", name=DAY_NUM_RE),
+        page.locator("button").filter(has_text=DAY_NUM_RE),
+        page.get_by_role("button", name=DATE_NAME_RE),
+    )
+    clicked = 0
+    for locator in candidates:
+        try:
+            count = min(locator.count(), 40)
+        except Exception:
+            continue
+        for i in range(count):
+            el = locator.nth(i)
+            try:
+                if not el.is_visible() or not el.is_enabled():
+                    continue
+                if el.get_attribute("aria-disabled") == "true":
+                    continue
+                label = (
+                    el.get_attribute("aria-label") or el.inner_text().strip()
+                )
+                if label and label not in available_days:
+                    available_days.append(label)
+                if clicked < 3:
+                    el.click(timeout=2_000)
+                    page.wait_for_timeout(4_000)
+                    page_texts.append(body_text(page))
+                    clicked += 1
+            except Exception:
+                continue
+        if available_days:
+            break
+    print(f"Enabled days seen: {len(available_days)}; opened {clicked}")
 
 
 def main() -> None:
@@ -97,71 +141,36 @@ def main() -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 480, "height": 960})
-
         page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(6_000)
-        page_texts.append(page.inner_text("body"))
-        shot(page, "shot-1-loaded.png")
 
-        # Step 1: welcome screen -> "Schedule a booking"
-        if click_first_match(page, (r"schedule", r"book")):
+        for n in range(1, MAX_STEPS + 1):
             page.wait_for_timeout(5_000)
-        shot(page, "shot-2-after-welcome.png")
+            text = body_text(page)
+            page_texts.append(text)
+            shot(page, f"shot-{n}.png")
+            low = text.lower()
 
-        # Step 2: pick the service
-        if click_first_match(page, (re.escape(SERVICE_NAME),)):
-            page.wait_for_timeout(6_000)
-        else:
-            print(f"Service '{SERVICE_NAME}' not found on page")
-        page_texts.append(page.inner_text("body"))
-        shot(page, "shot-3-after-service.png")
-
-        # Step 3: click through any intermediate screen if one appears
-        if click_first_match(
-            page, (r"^continue$", r"^next$", r"anyone|any team member|no preference")
-        ):
-            page.wait_for_timeout(5_000)
-        page_texts.append(page.inner_text("body"))
-
-        # Step 4: find enabled calendar days; open the first few
-        clicked_days = 0
-        for locator in (
-            page.get_by_role("button", name=DAY_NUM_RE),
-            page.get_by_role("gridcell", name=DAY_NUM_RE),
-            page.get_by_role("button", name=DATE_NAME_RE),
-        ):
-            try:
-                count = min(locator.count(), 31)
-            except Exception:
-                continue
-            for i in range(count):
-                el = locator.nth(i)
-                try:
-                    if not el.is_visible() or not el.is_enabled():
-                        continue
-                    if el.get_attribute("aria-disabled") == "true":
-                        continue
-                    label = (
-                        el.get_attribute("aria-label")
-                        or el.inner_text().strip()
-                    )
-                    available_days.append(label)
-                    if clicked_days < 3:
-                        el.click(timeout=2_000)
-                        page.wait_for_timeout(4_000)
-                        page_texts.append(page.inner_text("body"))
-                        clicked_days += 1
-                except Exception:
-                    continue
-            if available_days:
+            if "select service" in low:
+                acted = click_regex(page, re.escape(SERVICE_NAME))
+            elif "party size" in low:
+                acted = click_regex(page, rf"^\s*{re.escape(PARTY_SIZE)}\s*$")
+            elif "schedule a booking" in low:
+                acted = click_regex(page, r"schedule a booking|schedule|book")
+            else:
+                # Unknown screen — assume it's the date/time picker
+                print(f"Step {n}: treating as date/time screen")
+                scan_calendar(page, page_texts, available_days)
                 break
-        print(
-            f"Enabled days seen: {len(available_days)}; opened {clicked_days}"
-        )
+
+            if not acted:
+                print(f"Step {n}: recognized screen but couldn't click; stopping")
+                break
+
+        page.wait_for_timeout(2_000)
+        page_texts.append(body_text(page))
         shot(page, "screenshot.png")
         browser.close()
 
-    # Availability = times seen on the page; fall back to enabled days
     dom_times: set = set()
     for text in page_texts:
         dom_times.update(TIME_RE.findall(text))
