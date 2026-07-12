@@ -1,9 +1,12 @@
 """
-Chrome Hearts NY (West Village) appointment watcher — v2.
+Chrome Hearts NY (West Village) appointment watcher — v3.
 
-Selects a service on the Waitwhile booking page, opens the calendar,
-and sends a push notification via ntfy.sh when new appointment times
-appear. Tapping the notification opens the booking page.
+Waitwhile streams availability over Firebase (not plain API calls), so
+this version reads what actually renders on the page: it clicks
+"Schedule a booking" -> the chosen service -> the calendar, then looks
+for bookable times. Enabled calendar days count as availability too.
+Sends a push via ntfy.sh; tapping the notification opens the booking
+page. Saves a screenshot at every step (shot-*.png) for debugging.
 """
 import json
 import os
@@ -56,82 +59,75 @@ def notify(title: str, message: str) -> None:
     print("Notification sent")
 
 
-def walk_for_slots(node, out: set) -> None:
-    """Heuristically pull available slot labels out of Waitwhile API JSON."""
-    if isinstance(node, dict):
-        if node.get("available") is False or node.get("isAvailable") is False:
-            return
-        for key in ("time", "startTime", "start", "startDate"):
-            v = node.get(key)
-            if isinstance(v, str):
-                out.add(v)
-        times = node.get("times")
-        if isinstance(times, list):
-            for t in times:
-                if isinstance(t, str):
-                    out.add(t)
-        for v in node.values():
-            walk_for_slots(v, out)
-    elif isinstance(node, list):
-        for v in node:
-            walk_for_slots(v, out)
+def shot(page, name: str) -> None:
+    try:
+        page.screenshot(path=name, full_page=True)
+    except Exception as e:
+        print(f"Screenshot {name} failed: {e}")
+
+
+def click_first_match(page, patterns, roles=("button", "link")) -> bool:
+    """Click the first visible element matching any pattern, by role then text."""
+    for pattern in patterns:
+        rx = re.compile(pattern, re.I)
+        for role in roles:
+            try:
+                el = page.get_by_role(role, name=rx).first
+                if el.is_visible():
+                    el.click(timeout=5_000)
+                    print(f"Clicked {role} matching /{pattern}/")
+                    return True
+            except Exception:
+                continue
+        try:
+            el = page.get_by_text(rx).first
+            if el.is_visible():
+                el.click(timeout=5_000)
+                print(f"Clicked text matching /{pattern}/")
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def main() -> None:
-    api_hits = []
-    all_api_urls = []
     page_texts = []
+    available_days = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 480, "height": 960})
 
-        def on_response(resp):
-            u = resp.url
-            if "waitwhile" not in u:
-                return
-            if u not in all_api_urls:
-                all_api_urls.append(u)
-            if any(k in u.lower() for k in
-                   ("time", "availab", "slot", "booking", "date")):
-                try:
-                    api_hits.append({"url": u, "data": resp.json()})
-                except Exception:
-                    pass
-
-        page.on("response", on_response)
         page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=60_000)
         page.wait_for_timeout(6_000)
         page_texts.append(page.inner_text("body"))
+        shot(page, "shot-1-loaded.png")
 
-        # Step 1: pick the service explicitly
-        try:
-            page.get_by_text(
-                re.compile(SERVICE_NAME, re.I)
-            ).first.click(timeout=10_000)
-            print(f"Clicked service: {SERVICE_NAME}")
+        # Step 1: welcome screen -> "Schedule a booking"
+        if click_first_match(page, (r"schedule", r"book")):
             page.wait_for_timeout(5_000)
-        except Exception as e:
-            print(f"Could not click service '{SERVICE_NAME}': {e}")
+        shot(page, "shot-2-after-welcome.png")
 
-        # Step 2: click through any intermediate screen if one appears
-        for pattern in (r"^continue$", r"^next$",
-                        r"anyone|any team member|no preference"):
-            try:
-                btn = page.get_by_role(
-                    "button", name=re.compile(pattern, re.I)
-                ).first
-                if btn.is_visible():
-                    btn.click(timeout=3_000)
-                    page.wait_for_timeout(4_000)
-            except Exception:
-                pass
+        # Step 2: pick the service
+        if click_first_match(page, (re.escape(SERVICE_NAME),)):
+            page.wait_for_timeout(6_000)
+        else:
+            print(f"Service '{SERVICE_NAME}' not found on page")
+        page_texts.append(page.inner_text("body"))
+        shot(page, "shot-3-after-service.png")
+
+        # Step 3: click through any intermediate screen if one appears
+        if click_first_match(
+            page, (r"^continue$", r"^next$", r"anyone|any team member|no preference")
+        ):
+            page.wait_for_timeout(5_000)
         page_texts.append(page.inner_text("body"))
 
-        # Step 3: open the first few selectable days on the calendar
+        # Step 4: find enabled calendar days; open the first few
         clicked_days = 0
         for locator in (
             page.get_by_role("button", name=DAY_NUM_RE),
+            page.get_by_role("gridcell", name=DAY_NUM_RE),
             page.get_by_role("button", name=DATE_NAME_RE),
         ):
             try:
@@ -139,46 +135,45 @@ def main() -> None:
             except Exception:
                 continue
             for i in range(count):
-                if clicked_days >= 3:
-                    break
-                b = locator.nth(i)
+                el = locator.nth(i)
                 try:
-                    if (
-                        b.is_visible()
-                        and b.is_enabled()
-                        and b.get_attribute("aria-disabled") != "true"
-                    ):
-                        b.click(timeout=2_000)
-                        page.wait_for_timeout(3_000)
+                    if not el.is_visible() or not el.is_enabled():
+                        continue
+                    if el.get_attribute("aria-disabled") == "true":
+                        continue
+                    label = (
+                        el.get_attribute("aria-label")
+                        or el.inner_text().strip()
+                    )
+                    available_days.append(label)
+                    if clicked_days < 3:
+                        el.click(timeout=2_000)
+                        page.wait_for_timeout(4_000)
                         page_texts.append(page.inner_text("body"))
                         clicked_days += 1
                 except Exception:
                     continue
-            if clicked_days:
+            if available_days:
                 break
-        print(f"Opened {clicked_days} calendar day(s)")
-
-        page.screenshot(path="screenshot.png", full_page=True)
+        print(
+            f"Enabled days seen: {len(available_days)}; opened {clicked_days}"
+        )
+        shot(page, "screenshot.png")
         browser.close()
 
-    # Prefer structured API data; fall back to times visible on the page
-    slots: set = set()
-    for hit in api_hits:
-        walk_for_slots(hit["data"], slots)
+    # Availability = times seen on the page; fall back to enabled days
     dom_times: set = set()
     for text in page_texts:
         dom_times.update(TIME_RE.findall(text))
-    if not slots:
-        slots = dom_times
+    slots = set(dom_times) if dom_times else set(available_days)
 
     all_text = "\n".join(page_texts)
     Path("found.json").write_text(
         json.dumps(
             {
-                "all_api_urls": all_api_urls[:50],
-                "parsed_api_urls": [h["url"] for h in api_hits][:50],
-                "slots": sorted(slots),
                 "dom_times": sorted(dom_times),
+                "available_days": available_days,
+                "slots": sorted(slots),
                 "saw_no_availability_text": bool(NO_AVAIL_RE.search(all_text)),
             },
             indent=2,
@@ -200,7 +195,7 @@ def main() -> None:
         more = f" (+{len(new_slots) - 6} more)" if len(new_slots) > 6 else ""
         notify(
             "Chrome Hearts NY: appointment available",
-            f"New times: {preview}{more}. Tap to book.",
+            f"New availability: {preview}{more}. Tap to book.",
         )
 
     STATE_FILE.write_text(json.dumps({"slots": sorted(slots)}, indent=2))
