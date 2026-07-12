@@ -1,10 +1,9 @@
 """
-Chrome Hearts NY (West Village) appointment watcher.
+Chrome Hearts NY (West Village) appointment watcher — v2.
 
-Loads the Waitwhile booking page in a headless browser, watches the
-availability API responses, and sends a push notification via ntfy.sh
-when new appointment slots appear. Tapping the notification opens the
-booking page.
+Selects a service on the Waitwhile booking page, opens the calendar,
+and sends a push notification via ntfy.sh when new appointment times
+appear. Tapping the notification opens the booking page.
 """
 import json
 import os
@@ -14,18 +13,24 @@ from pathlib import Path
 import requests
 from playwright.sync_api import sync_playwright
 
-# The page the script checks (goes straight into the booking flow)
 BOOKING_URL = os.environ.get(
     "BOOKING_URL", "https://waitwhile.com/locations/chromehearts/bookings/add"
 )
-# The page that opens when you tap the notification
 CLICK_URL = os.environ.get(
     "CLICK_URL", "https://waitwhile.com/locations/chromehearts"
 )
+# Which service to watch — change to "Product Pickup", "Repair", etc. if needed
+SERVICE_NAME = os.environ.get("SERVICE_NAME", "Personal Shopping")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 STATE_FILE = Path("state.json")
 
 TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)\b")
+DAY_NUM_RE = re.compile(r"^\s*\d{1,2}\s*$")
+DATE_NAME_RE = re.compile(
+    r"(January|February|March|April|May|June|July|August"
+    r"|September|October|November|December)",
+    re.I,
+)
 NO_AVAIL_RE = re.compile(
     r"(no (times|availability|appointments)|fully booked|no slots)", re.I
 )
@@ -74,52 +79,85 @@ def walk_for_slots(node, out: set) -> None:
 
 def main() -> None:
     api_hits = []
+    all_api_urls = []
+    page_texts = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 480, "height": 960})
 
         def on_response(resp):
-            u = resp.url.lower()
-            if "waitwhile" in u and any(
-                k in u for k in ("booking-times", "availab", "slots", "times")
-            ):
+            u = resp.url
+            if "waitwhile" not in u:
+                return
+            if u not in all_api_urls:
+                all_api_urls.append(u)
+            if any(k in u.lower() for k in
+                   ("time", "availab", "slot", "booking", "date")):
                 try:
-                    api_hits.append({"url": resp.url, "data": resp.json()})
+                    api_hits.append({"url": u, "data": resp.json()})
                 except Exception:
                     pass
 
         page.on("response", on_response)
         page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=60_000)
         page.wait_for_timeout(6_000)
+        page_texts.append(page.inner_text("body"))
 
-        # Try to advance through the booking flow (service selection screens)
-        for _ in range(3):
-            clicked = False
-            for pattern in (r"book", r"appointment", r"continue", r"next"):
+        # Step 1: pick the service explicitly
+        try:
+            page.get_by_text(
+                re.compile(SERVICE_NAME, re.I)
+            ).first.click(timeout=10_000)
+            print(f"Clicked service: {SERVICE_NAME}")
+            page.wait_for_timeout(5_000)
+        except Exception as e:
+            print(f"Could not click service '{SERVICE_NAME}': {e}")
+
+        # Step 2: click through any intermediate screen if one appears
+        for pattern in (r"^continue$", r"^next$",
+                        r"anyone|any team member|no preference"):
+            try:
+                btn = page.get_by_role(
+                    "button", name=re.compile(pattern, re.I)
+                ).first
+                if btn.is_visible():
+                    btn.click(timeout=3_000)
+                    page.wait_for_timeout(4_000)
+            except Exception:
+                pass
+        page_texts.append(page.inner_text("body"))
+
+        # Step 3: open the first few selectable days on the calendar
+        clicked_days = 0
+        for locator in (
+            page.get_by_role("button", name=DAY_NUM_RE),
+            page.get_by_role("button", name=DATE_NAME_RE),
+        ):
+            try:
+                count = min(locator.count(), 31)
+            except Exception:
+                continue
+            for i in range(count):
+                if clicked_days >= 3:
+                    break
+                b = locator.nth(i)
                 try:
-                    btn = page.get_by_role(
-                        "button", name=re.compile(pattern, re.I)
-                    ).first
-                    if btn.is_visible():
-                        btn.click(timeout=3_000)
-                        clicked = True
-                        break
+                    if (
+                        b.is_visible()
+                        and b.is_enabled()
+                        and b.get_attribute("aria-disabled") != "true"
+                    ):
+                        b.click(timeout=2_000)
+                        page.wait_for_timeout(3_000)
+                        page_texts.append(page.inner_text("body"))
+                        clicked_days += 1
                 except Exception:
                     continue
-            if not clicked:
-                try:  # fall back: first service card / list item
-                    item = page.locator("[role=listitem], main button").first
-                    if item.is_visible():
-                        item.click(timeout=3_000)
-                        clicked = True
-                except Exception:
-                    pass
-            page.wait_for_timeout(4_000)
-            if not clicked:
+            if clicked_days:
                 break
+        print(f"Opened {clicked_days} calendar day(s)")
 
-        body_text = page.inner_text("body")
         page.screenshot(path="screenshot.png", full_page=True)
         browser.close()
 
@@ -127,18 +165,21 @@ def main() -> None:
     slots: set = set()
     for hit in api_hits:
         walk_for_slots(hit["data"], slots)
-    dom_times = set(TIME_RE.findall(body_text))
+    dom_times: set = set()
+    for text in page_texts:
+        dom_times.update(TIME_RE.findall(text))
     if not slots:
         slots = dom_times
 
-    # Debug dump (uploaded as a workflow artifact)
+    all_text = "\n".join(page_texts)
     Path("found.json").write_text(
         json.dumps(
             {
-                "api_urls": [h["url"] for h in api_hits],
+                "all_api_urls": all_api_urls[:50],
+                "parsed_api_urls": [h["url"] for h in api_hits][:50],
                 "slots": sorted(slots),
                 "dom_times": sorted(dom_times),
-                "saw_no_availability_text": bool(NO_AVAIL_RE.search(body_text)),
+                "saw_no_availability_text": bool(NO_AVAIL_RE.search(all_text)),
             },
             indent=2,
         )
