@@ -46,6 +46,7 @@ jobs:
           name: debug-${{ github.run_id }}
           path: |
             screenshot.png
+            shot-*.png
             found.json
           if-no-files-found: ignore
           retention-days: 3
