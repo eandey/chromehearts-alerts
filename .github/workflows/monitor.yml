@@ -2,12 +2,17 @@ name: Chrome Hearts NY appointment watch
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every ~10 minutes (GitHub may add delays)
+    - cron: "*/5 * * * *"    # every ~5 minutes (GitHub may add delays)
   workflow_dispatch:          # lets you run it manually to test
+
+concurrency:
+  group: appointment-watch
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +35,8 @@ jobs:
       - name: Check availability
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          CHECKS_PER_RUN: "4"
+          SLEEP_SECONDS: "15"
         run: python monitor.py
 
       - name: Save state

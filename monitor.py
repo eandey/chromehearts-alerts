@@ -1,17 +1,24 @@
 """
-Chrome Hearts NY (West Village) appointment watcher — v5.
+Chrome Hearts NY (West Village) appointment watcher — v7.
 
-Flow: welcome -> service -> party size -> "Select date and time".
-On the date/time screen: if the page says "No available times for the
-next N days", there's nothing bookable — stop quietly. Otherwise click
-through each day chip (Mon 13 Jul, Tue 14 Jul, ...) and record the
-times that render, e.g. "Mon 13 Jul 11:30 AM". New slots trigger an
-ntfy.sh push; tapping the notification opens the booking page.
-Saves shot-N.png at every step for debugging.
+Changes vs v6:
+- Runs several checks per invocation (CHECKS_PER_RUN, SLEEP_SECONDS)
+  so GitHub's 5-minute cron floor still yields ~1-minute coverage
+- Notifies immediately mid-run when a new slot appears
+
+Flow per check: welcome -> service -> party size -> "Select date and
+time". If the page says "No available times for the next N days",
+stop quietly. Otherwise click each day chip across up to 3 pages of
+the date strip, record times per day (e.g. "Mon 13 Jul 6:00 PM"),
+and push new ones via ntfy.sh. Tapping the notification opens the
+booking page.
 """
 import json
 import os
 import re
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -26,8 +33,11 @@ CLICK_URL = os.environ.get(
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "Personal Shopping")
 PARTY_SIZE = os.environ.get("PARTY_SIZE", "1")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+CHECKS_PER_RUN = int(os.environ.get("CHECKS_PER_RUN", "1"))
+SLEEP_SECONDS = int(os.environ.get("SLEEP_SECONDS", "0"))
 STATE_FILE = Path("state.json")
 MAX_STEPS = 8
+DATE_PAGES = 3  # pages of the date strip to scan
 
 TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)\b")
 DAY_CHIP_RE = re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b", re.I)
@@ -41,24 +51,31 @@ NO_AVAIL_WINDOW_RE = re.compile(
 )
 
 
-def notify(title: str, message: str) -> None:
+def notify(title: str, message: str) -> bool:
     if not NTFY_TOPIC:
         print("NTFY_TOPIC not set; skipping notification")
-        return
-    r = requests.post(
-        f"https://ntfy.sh/{NTFY_TOPIC}",
-        data=message.encode("utf-8"),
-        headers={
-            "Title": title,
-            # Tapping the notification opens the booking page:
-            "Click": CLICK_URL,
-            "Priority": "urgent",
-            "Tags": "bell",
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    print("Notification sent")
+        return True
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(
+                f"https://ntfy.sh/{NTFY_TOPIC}",
+                data=message.encode("utf-8"),
+                headers={
+                    "Title": title,
+                    # Tapping the notification opens the booking page:
+                    "Click": CLICK_URL,
+                    "Priority": "urgent",
+                    "Tags": "bell",
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            print(f"Notification sent (attempt {attempt})")
+            return True
+        except Exception as e:
+            print(f"Notify attempt {attempt} failed: {e}")
+            time.sleep(5 * attempt)
+    return False
 
 
 def shot(page, name: str) -> None:
@@ -129,7 +146,8 @@ def scan_day_chips(page, page_texts: list, slots: set) -> int:
     return scanned
 
 
-def main() -> None:
+def run_check() -> tuple[set, bool]:
+    """One full pass through the booking flow. Returns (slots, fully_booked)."""
     page_texts = []
     slots: set = set()
     fully_booked = False
@@ -159,12 +177,12 @@ def main() -> None:
                     fully_booked = True
                     print("Page says no availability in the whole window")
                 else:
-                    # Something may be open — scan visible days, then the
-                    # next page of days if there's a next arrow
-                    scan_day_chips(page, page_texts, slots)
-                    if click_regex(page, r"next|forward"):
-                        page.wait_for_timeout(2_500)
+                    for page_num in range(DATE_PAGES):
                         scan_day_chips(page, page_texts, slots)
+                        if page_num < DATE_PAGES - 1:
+                            if not click_regex(page, r"next|forward"):
+                                break
+                            page.wait_for_timeout(2_500)
                 break
 
             if not acted:
@@ -183,30 +201,59 @@ def main() -> None:
                 "slots": sorted(slots),
                 "fully_booked_message": fully_booked,
                 "saw_no_availability_text": bool(NO_AVAIL_RE.search(all_text)),
+                "checked_at_utc": datetime.now(timezone.utc).isoformat(),
             },
             indent=2,
         )
     )
+    return slots, fully_booked
 
-    old: set = set()
+
+def load_state() -> set:
     if STATE_FILE.exists():
         try:
-            old = set(json.loads(STATE_FILE.read_text()).get("slots", []))
+            return set(json.loads(STATE_FILE.read_text()).get("slots", []))
         except Exception:
             pass
+    return set()
 
-    new_slots = slots - old
-    print(f"Found {len(slots)} slot(s); {len(new_slots)} new since last check")
 
-    if new_slots:
-        preview = ", ".join(sorted(new_slots)[:5])
-        more = f" (+{len(new_slots) - 5} more)" if len(new_slots) > 5 else ""
-        notify(
-            "Chrome Hearts NY: appointment available",
-            f"{preview}{more}. Tap to book.",
-        )
+def main() -> None:
+    notify_failed = False
 
-    STATE_FILE.write_text(json.dumps({"slots": sorted(slots)}, indent=2))
+    for i in range(CHECKS_PER_RUN):
+        if i:
+            time.sleep(SLEEP_SECONDS)
+        stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        print(f"--- Check {i + 1}/{CHECKS_PER_RUN} at {stamp} UTC ---")
+
+        try:
+            slots, _ = run_check()
+        except Exception as e:
+            print(f"Check failed: {e}")
+            continue
+
+        old = load_state()
+        new_slots = slots - old
+        print(f"Found {len(slots)} slot(s); {len(new_slots)} new")
+
+        if new_slots:
+            preview = ", ".join(sorted(new_slots)[:5])
+            more = f" (+{len(new_slots) - 5} more)" if len(new_slots) > 5 else ""
+            sent = notify(
+                "Chrome Hearts NY: appointment available",
+                f"{preview}{more}. Tap to book.",
+            )
+            if not sent:
+                # Keep old state so the next check re-alerts these slots
+                notify_failed = True
+                print("All notify attempts failed; keeping old state")
+                continue
+
+        STATE_FILE.write_text(json.dumps({"slots": sorted(slots)}, indent=2))
+
+    if notify_failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
