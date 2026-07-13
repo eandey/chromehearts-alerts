@@ -1,13 +1,17 @@
 [Unit]
-Description=Chrome Hearts appointment check
+Description=Chrome Hearts appointment watcher (continuous)
 Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=oneshot
+Type=simple
 User=chmonitor
 WorkingDirectory=/opt/chromehearts/run
 EnvironmentFile=/etc/chromehearts-monitor.env
-Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/chromehearts/browsers
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/chromehearts/venv/bin/python /opt/chromehearts/monitor.py
-TimeoutStartSec=300
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

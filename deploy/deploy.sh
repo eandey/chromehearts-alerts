@@ -15,7 +15,6 @@ ssh "$HOST" "mkdir -p $STAGE"
 scp "$REPO_DIR/monitor.py" "$REPO_DIR/requirements.txt" \
     "$REPO_DIR"/deploy/setup.sh \
     "$REPO_DIR"/deploy/chromehearts-monitor.service \
-    "$REPO_DIR"/deploy/chromehearts-monitor.timer \
     "$REPO_DIR"/deploy/chromehearts-heartbeat.service \
     "$REPO_DIR"/deploy/chromehearts-heartbeat.timer \
     "$HOST:$STAGE/"

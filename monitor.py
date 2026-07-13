@@ -1,59 +1,70 @@
 """
-Chrome Hearts NY (West Village) appointment watcher — v7.
+Chrome Hearts NY (West Village) appointment watcher — v8.
 
-Changes vs v6:
-- Runs several checks per invocation (CHECKS_PER_RUN, SLEEP_SECONDS)
-  so GitHub's 5-minute cron floor still yields ~1-minute coverage
-- Notifies immediately mid-run when a new slot appears
+Changes vs v7:
+- Polls the Waitwhile public API directly (the same endpoint the
+  booking page's own frontend calls) instead of driving a headless
+  browser. One GET returns the first available slots, so a check
+  takes <1s and we poll every few seconds (POLL_SECONDS).
+- Runs as a long-lived daemon under systemd (Restart=always) and
+  notifies via ntfy the moment a new slot appears.
+- Set MAX_RUNTIME_SECONDS > 0 for bounded runs (GitHub Actions backup).
 
-Flow per check: welcome -> service -> party size -> "Select date and
-time". If the page says "No available times for the next N days",
-stop quietly. Otherwise click each day chip across up to 3 pages of
-the date strip, record times per day (e.g. "Mon 13 Jul 6:00 PM"),
-and push new ones via ntfy.sh. Tapping the notification opens the
-booking page.
+Endpoint discovered from the booking page's network traffic:
+  GET https://api.waitwhile.com/v2/public/visits/{slug}/first-available-slots
+      ?fromDate=...&toDate=...&maxNumSlots=N&serviceDuration=1800
+      &partySize=1&serviceIds=<Personal Shopping id>
+Returns [] when fully booked, or a list of slots (objects with a
+"date" field, e.g. "2026-07-14T11:00" in the store's local time).
 """
 import json
 import os
-import re
+import random
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
-from playwright.sync_api import sync_playwright
 
-BOOKING_URL = os.environ.get(
-    "BOOKING_URL", "https://waitwhile.com/locations/chromehearts/bookings/add"
+LOCATION_SLUG = os.environ.get("LOCATION_SLUG", "chromehearts")
+API_URL = (
+    f"https://api.waitwhile.com/v2/public/visits/{LOCATION_SLUG}"
+    "/first-available-slots"
 )
 CLICK_URL = os.environ.get(
-    "CLICK_URL", "https://waitwhile.com/locations/chromehearts"
+    "CLICK_URL", f"https://waitwhile.com/locations/{LOCATION_SLUG}"
 )
-SERVICE_NAME = os.environ.get("SERVICE_NAME", "Personal Shopping")
+# "Personal Shopping" at Chrome Hearts NY West Village
+SERVICE_ID = os.environ.get("SERVICE_ID", "WHmjBONC1Mcf8VSqjWar")
+SERVICE_DURATION = int(os.environ.get("SERVICE_DURATION", "1800"))
 PARTY_SIZE = os.environ.get("PARTY_SIZE", "1")
+MAX_SLOTS = int(os.environ.get("MAX_SLOTS", "10"))
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
-CHECKS_PER_RUN = int(os.environ.get("CHECKS_PER_RUN", "1"))
-SLEEP_SECONDS = int(os.environ.get("SLEEP_SECONDS", "0"))
+POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "5"))
+MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", "0"))
+STORE_TZ = ZoneInfo(os.environ.get("STORE_TZ", "America/New_York"))
+# Alert once if every poll has failed for this long (0 disables):
+ERROR_ALERT_AFTER_SECONDS = int(os.environ.get("ERROR_ALERT_AFTER_SECONDS", "900"))
+STATUS_LOG_EVERY = int(os.environ.get("STATUS_LOG_EVERY", "60"))  # polls
+
 STATE_FILE = Path("state.json")
-MAX_STEPS = 8
-DATE_PAGES = 3  # pages of the date strip to scan
-
-TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)\b")
-DAY_CHIP_RE = re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b", re.I)
-NO_AVAIL_RE = re.compile(
-    r"(no available (times|appointments)|no (times|availability|appointments)"
-    r"|fully booked|no slots)",
-    re.I,
-)
-NO_AVAIL_WINDOW_RE = re.compile(
-    r"no available times for the next \d+ days", re.I
+FOUND_FILE = Path("found.json")
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
 
-def notify(title: str, message: str) -> bool:
+def log(msg: str) -> None:
+    stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"[{stamp} UTC] {msg}", flush=True)
+
+
+def notify(title: str, message: str, priority: str = "urgent") -> bool:
     if not NTFY_TOPIC:
-        print("NTFY_TOPIC not set; skipping notification")
+        log(f"NTFY_TOPIC not set; would have sent: {title} — {message}")
         return True
     for attempt in range(1, 4):
         try:
@@ -64,149 +75,55 @@ def notify(title: str, message: str) -> bool:
                     "Title": title,
                     # Tapping the notification opens the booking page:
                     "Click": CLICK_URL,
-                    "Priority": "urgent",
+                    "Priority": priority,
                     "Tags": "bell",
                 },
                 timeout=30,
             )
             r.raise_for_status()
-            print(f"Notification sent (attempt {attempt})")
+            log(f"Notification sent (attempt {attempt})")
             return True
         except Exception as e:
-            print(f"Notify attempt {attempt} failed: {e}")
+            log(f"Notify attempt {attempt} failed: {e}")
             time.sleep(5 * attempt)
     return False
 
 
-def shot(page, name: str) -> None:
-    try:
-        page.screenshot(path=name, full_page=True)
-    except Exception as e:
-        print(f"Screenshot {name} failed: {e}")
+def fetch_slots(session: requests.Session) -> list:
+    """One availability check. Returns raw slot datetimes like
+    '2026-07-14T11:00' (store-local). Raises on any failure."""
+    now = datetime.now(STORE_TZ)
+    params = {
+        "fromDate": now.strftime("%Y-%m-%dT%H:%M"),
+        "toDate": (now + timedelta(days=365)).strftime("%Y-%m-%dT00:00"),
+        "maxNumSlots": MAX_SLOTS,
+        "serviceDuration": SERVICE_DURATION,
+        "partySize": PARTY_SIZE,
+        "serviceIds": SERVICE_ID,
+    }
+    r = session.get(API_URL, params=params, timeout=15)
+    r.raise_for_status()
+    payload = r.json()
+    if not isinstance(payload, list):
+        raise ValueError(f"Unexpected payload: {str(payload)[:200]}")
+    dates = []
+    for item in payload:
+        if isinstance(item, str):
+            dates.append(item)
+        elif isinstance(item, dict):
+            d = item.get("date") or item.get("startDate") or item.get("from")
+            if d:
+                dates.append(d)
+    return dates
 
 
-def body_text(page) -> str:
+def pretty(slot: str) -> str:
+    """'2026-07-14T11:00' -> 'Tue Jul 14, 11:00 AM' (falls back to raw)."""
     try:
-        return page.inner_text("body")
+        dt = datetime.fromisoformat(slot.replace("Z", "+00:00"))
+        return dt.strftime("%a %b %-d, %-I:%M %p")
     except Exception:
-        return ""
-
-
-def click_regex(page, pattern: str) -> bool:
-    """Click the first visible element matching pattern (button, link, or text)."""
-    rx = re.compile(pattern, re.I)
-    for get in (
-        lambda: page.get_by_role("button", name=rx).first,
-        lambda: page.get_by_role("link", name=rx).first,
-        lambda: page.get_by_text(rx).first,
-    ):
-        try:
-            el = get()
-            if el.is_visible():
-                el.click(timeout=5_000)
-                print(f"Clicked /{pattern}/")
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def scan_day_chips(page, page_texts: list, slots: set) -> int:
-    """Click each visible day chip and record 'day + time' slots."""
-    scanned = 0
-    for role in ("button", "tab", "radio", "option"):
-        loc = page.get_by_role(role, name=DAY_CHIP_RE)
-        try:
-            count = min(loc.count(), 14)
-        except Exception:
-            continue
-        if count == 0:
-            continue
-        for i in range(count):
-            el = loc.nth(i)
-            try:
-                if not el.is_visible() or not el.is_enabled():
-                    continue
-                if el.get_attribute("aria-disabled") == "true":
-                    continue
-                label = (
-                    el.get_attribute("aria-label") or el.inner_text()
-                ).strip().replace("\n", " ")
-                el.click(timeout=2_000)
-                page.wait_for_timeout(2_500)
-                text = body_text(page)
-                page_texts.append(text)
-                for t in sorted(set(TIME_RE.findall(text))):
-                    slots.add(f"{label} {t}")
-                scanned += 1
-            except Exception:
-                continue
-        if scanned:
-            break
-    return scanned
-
-
-def run_check() -> tuple[set, bool]:
-    """One full pass through the booking flow. Returns (slots, fully_booked)."""
-    page_texts = []
-    slots: set = set()
-    fully_booked = False
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(viewport={"width": 480, "height": 960})
-        page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=60_000)
-
-        for n in range(1, MAX_STEPS + 1):
-            page.wait_for_timeout(5_000)
-            text = body_text(page)
-            page_texts.append(text)
-            shot(page, f"shot-{n}.png")
-            low = text.lower()
-
-            if "select service" in low:
-                acted = click_regex(page, re.escape(SERVICE_NAME))
-            elif "party size" in low:
-                acted = click_regex(page, rf"^\s*{re.escape(PARTY_SIZE)}\s*$")
-            elif "schedule a booking" in low:
-                acted = click_regex(page, r"schedule a booking|schedule|book")
-            else:
-                # Date/time screen (or something new — screenshots will show)
-                print(f"Step {n}: treating as date/time screen")
-                if NO_AVAIL_WINDOW_RE.search(text):
-                    fully_booked = True
-                    print("Page says no availability in the whole window")
-                else:
-                    for page_num in range(DATE_PAGES):
-                        scan_day_chips(page, page_texts, slots)
-                        if page_num < DATE_PAGES - 1:
-                            if not click_regex(page, r"next|forward"):
-                                break
-                            page.wait_for_timeout(2_500)
-                break
-
-            if not acted:
-                print(f"Step {n}: recognized screen but couldn't click; stopping")
-                break
-
-        page.wait_for_timeout(2_000)
-        page_texts.append(body_text(page))
-        shot(page, "screenshot.png")
-        browser.close()
-
-    all_text = "\n".join(page_texts)
-    Path("found.json").write_text(
-        json.dumps(
-            {
-                "slots": sorted(slots),
-                "fully_booked_message": fully_booked,
-                "saw_no_availability_text": bool(NO_AVAIL_RE.search(all_text)),
-                "checked_at_utc": datetime.now(timezone.utc).isoformat(),
-            },
-            indent=2,
-        )
-    )
-    return slots, fully_booked
+        return slot
 
 
 def load_state() -> set:
@@ -218,43 +135,103 @@ def load_state() -> set:
     return set()
 
 
+def save_state(slots: set) -> None:
+    STATE_FILE.write_text(json.dumps({"slots": sorted(slots)}, indent=2))
+
+
+def save_found(slots: list) -> None:
+    FOUND_FILE.write_text(
+        json.dumps(
+            {
+                "slots": sorted(slots),
+                "checked_at_utc": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+    )
+
+
 def main() -> None:
-    notify_failed = False
+    log(
+        f"Watcher starting: poll every {POLL_SECONDS:g}s, service={SERVICE_ID}, "
+        f"party={PARTY_SIZE}, ntfy={'set' if NTFY_TOPIC else 'NOT SET'}"
+    )
+    session = requests.Session()
+    session.headers["User-Agent"] = USER_AGENT
 
-    for i in range(CHECKS_PER_RUN):
-        if i:
-            time.sleep(SLEEP_SECONDS)
-        stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        print(f"--- Check {i + 1}/{CHECKS_PER_RUN} at {stamp} UTC ---")
+    started = time.monotonic()
+    known = load_state()
+    polls = 0
+    failures_since = None  # monotonic time of first failure in a streak
+    error_alerted = False
+    backoff = 0.0
 
+    while True:
+        polls += 1
         try:
-            slots, _ = run_check()
+            slots = fetch_slots(session)
         except Exception as e:
-            print(f"Check failed: {e}")
+            now_mono = time.monotonic()
+            if failures_since is None:
+                failures_since = now_mono
+            failing_for = now_mono - failures_since
+            log(f"Poll failed ({failing_for:.0f}s into streak): {e}")
+            if (
+                ERROR_ALERT_AFTER_SECONDS
+                and not error_alerted
+                and failing_for >= ERROR_ALERT_AFTER_SECONDS
+            ):
+                error_alerted = notify(
+                    "Chrome Hearts monitor: checks failing",
+                    f"Availability checks have failed for {failing_for / 60:.0f} "
+                    f"minutes. Last error: {e}",
+                    priority="high",
+                )
+            backoff = min(max(backoff * 2, POLL_SECONDS * 2), 300)
+            time.sleep(backoff)
             continue
 
-        old = load_state()
-        new_slots = slots - old
-        print(f"Found {len(slots)} slot(s); {len(new_slots)} new")
+        if failures_since is not None:
+            log("Polls recovered")
+        failures_since = None
+        error_alerted = False
+        backoff = 0.0
 
+        current = set(slots)
+        new_slots = current - known
         if new_slots:
-            preview = ", ".join(sorted(new_slots)[:5])
+            log(f"NEW AVAILABILITY: {sorted(new_slots)}")
+            save_found(slots)
+            shown = [pretty(s) for s in sorted(new_slots)[:5]]
             more = f" (+{len(new_slots) - 5} more)" if len(new_slots) > 5 else ""
             sent = notify(
                 "Chrome Hearts NY: appointment available",
-                f"{preview}{more}. Tap to book.",
+                f"{', '.join(shown)}{more}. Tap to book.",
             )
-            if not sent:
-                # Keep old state so the next check re-alerts these slots
-                notify_failed = True
-                print("All notify attempts failed; keeping old state")
-                continue
+            if sent:
+                known = current
+                save_state(known)
+            else:
+                log("All notify attempts failed; will re-alert next poll")
+        elif current != known:
+            # Slots disappeared (booked/withdrawn) — clear them so a
+            # reappearance re-alerts.
+            log(f"Availability changed: {sorted(known)} -> {sorted(current)}")
+            save_found(slots)
+            known = current
+            save_state(known)
+        elif polls % STATUS_LOG_EVERY == 1:
+            log(f"Poll #{polls}: {len(current)} slot(s) known, no change")
 
-        STATE_FILE.write_text(json.dumps({"slots": sorted(slots)}, indent=2))
+        if MAX_RUNTIME_SECONDS and time.monotonic() - started >= MAX_RUNTIME_SECONDS:
+            log(f"MAX_RUNTIME_SECONDS={MAX_RUNTIME_SECONDS} reached; exiting")
+            return
 
-    if notify_failed:
-        sys.exit(1)
+        time.sleep(POLL_SECONDS * random.uniform(0.8, 1.2))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
