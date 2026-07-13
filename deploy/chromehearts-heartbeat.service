@@ -5,4 +5,4 @@ Description=Daily liveness ping for the Chrome Hearts monitor
 Type=oneshot
 User=chmonitor
 EnvironmentFile=/etc/chromehearts-monitor.env
-ExecStart=/bin/sh -c 'curl -fsS -H "X-Priority: min" -H "X-Title: Chrome Hearts monitor" -d "Heartbeat: monitor is alive on $(hostname)" "https://ntfy.sh/$NTFY_TOPIC" > /dev/null'
+ExecStart=/bin/sh -c 'curl -fsS -H "X-Priority: min" -H "X-Title: Appointment watchers" -d "Heartbeat from $(hostname): chromehearts=$(systemctl is-active chromehearts-monitor.service), goldendiner=$(systemctl is-active resy-monitor.service)" "https://ntfy.sh/$NTFY_TOPIC" > /dev/null'

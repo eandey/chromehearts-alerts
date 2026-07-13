@@ -26,7 +26,7 @@ apt-get install -y python3-venv curl
 id -u chmonitor &>/dev/null || useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin chmonitor
 
 install -d "$APP_DIR" "$APP_DIR/run"
-install -m 644 monitor.py requirements.txt "$APP_DIR/"
+install -m 644 monitor.py resy_monitor.py requirements.txt "$APP_DIR/"
 
 if [[ ! -d "$APP_DIR/venv" ]]; then
     python3 -m venv "$APP_DIR/venv"
@@ -58,21 +58,23 @@ rm -f /etc/systemd/system/chromehearts-monitor.timer
 "$APP_DIR/venv/bin/pip" uninstall --quiet --yes playwright 2>/dev/null || true
 rm -rf "$APP_DIR/browsers"
 
-install -m 644 chromehearts-monitor.service \
+install -m 644 chromehearts-monitor.service resy-monitor.service \
     chromehearts-heartbeat.service chromehearts-heartbeat.timer /etc/systemd/system/
 
 systemctl daemon-reload
-systemctl enable chromehearts-monitor.service chromehearts-heartbeat.timer
-systemctl restart chromehearts-monitor.service
+systemctl enable chromehearts-monitor.service resy-monitor.service chromehearts-heartbeat.timer
+systemctl restart chromehearts-monitor.service resy-monitor.service
 systemctl start chromehearts-heartbeat.timer
 
 echo
 echo "Waiting a few seconds, then showing watcher logs..."
 sleep 5
-journalctl -u chromehearts-monitor.service -n 15 --no-pager
+journalctl -u chromehearts-monitor.service -n 10 --no-pager
+journalctl -u resy-monitor.service -n 10 --no-pager
 
 echo
-echo "Done. The watcher polls continuously. Useful commands:"
-echo "  systemctl status chromehearts-monitor       # daemon state"
-echo "  journalctl -u chromehearts-monitor -f       # live logs"
-echo "  cat $APP_DIR/run/found.json                 # last availability seen"
+echo "Done. Both watchers poll continuously. Useful commands:"
+echo "  systemctl status chromehearts-monitor resy-monitor   # daemon state"
+echo "  journalctl -u chromehearts-monitor -f                # live logs (Chrome Hearts)"
+echo "  journalctl -u resy-monitor -f                        # live logs (Golden Diner)"
+echo "  cat $APP_DIR/run/found.json $APP_DIR/run/resy_found.json  # last availability seen"
