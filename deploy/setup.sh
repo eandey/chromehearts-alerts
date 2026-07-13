@@ -62,14 +62,18 @@ install -m 644 chromehearts-monitor.service resy-monitor.service \
     chromehearts-heartbeat.service chromehearts-heartbeat.timer /etc/systemd/system/
 
 systemctl daemon-reload
-systemctl enable chromehearts-monitor.service resy-monitor.service chromehearts-heartbeat.timer
-systemctl restart chromehearts-monitor.service resy-monitor.service
+# Chrome Hearts alerts are switched off (user request, 2026-07-13).
+# To turn them back on:  systemctl enable --now chromehearts-monitor.service
+systemctl enable resy-monitor.service chromehearts-heartbeat.timer
+systemctl restart resy-monitor.service
+if systemctl is-enabled --quiet chromehearts-monitor.service; then
+    systemctl restart chromehearts-monitor.service
+fi
 systemctl start chromehearts-heartbeat.timer
 
 echo
 echo "Waiting a few seconds, then showing watcher logs..."
 sleep 5
-journalctl -u chromehearts-monitor.service -n 10 --no-pager
 journalctl -u resy-monitor.service -n 10 --no-pager
 
 echo
