@@ -32,9 +32,17 @@ POLL_SECONDS = float(os.environ.get("RESY_POLL_SECONDS", "10"))
 API_KEY = os.environ.get(
     "RESY_API_KEY", "VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5"
 )
+# resy.com/link is Resy's universal link: it opens the app on phones
+# and forwards date/seats, landing on the venue page with that day
+# preselected and its open slots one tap from booking.
 CLICK_URL = os.environ.get(
-    "RESY_CLICK_URL", f"https://resy.com/link?venue_id={VENUE_ID}"
+    "RESY_CLICK_URL",
+    f"https://resy.com/link?venue_id={VENUE_ID}&seats={PARTY_SIZE}",
 )
+
+
+def day_link(day: str) -> str:
+    return f"{CLICK_URL}&date={day}" if "resy.com/link" in CLICK_URL else CLICK_URL
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", "0"))
 STORE_TZ = ZoneInfo(os.environ.get("STORE_TZ", "America/New_York"))
@@ -56,9 +64,12 @@ def log(msg: str) -> None:
     print(f"[{stamp} UTC] {msg}", flush=True)
 
 
-def notify(title: str, message: str, priority: str = "urgent") -> bool:
+def notify(
+    title: str, message: str, priority: str = "urgent", click_url: str = None
+) -> bool:
+    click_url = click_url or CLICK_URL
     if not NTFY_TOPIC:
-        log(f"NTFY_TOPIC not set; would have sent: {title} — {message}")
+        log(f"NTFY_TOPIC not set; would have sent: {title} — {message} -> {click_url}")
         return True
     for attempt in range(1, 4):
         try:
@@ -68,7 +79,7 @@ def notify(title: str, message: str, priority: str = "urgent") -> bool:
                 headers={
                     "Title": title,
                     # Tapping the notification opens the Resy page:
-                    "Click": CLICK_URL,
+                    "Click": click_url,
                     "Priority": priority,
                     "Tags": "fork_and_knife",
                 },
@@ -240,9 +251,11 @@ def main() -> None:
         if new_dates:
             log(f"NEW AVAILABILITY: {sorted(new_dates)}")
             save_found(available)
+            first_day = sorted(new_dates)[0]
             sent = notify(
                 f"{VENUE_NAME}: reservation available",
                 f"{describe(session, sorted(new_dates))}. Tap to book.",
+                click_url=day_link(first_day),
             )
             if sent:
                 known = available

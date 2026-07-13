@@ -33,8 +33,11 @@ API_URL = (
     f"https://api.waitwhile.com/v2/public/visits/{LOCATION_SLUG}"
     "/first-available-slots"
 )
+# Lands directly on the date/time picker (skips welcome/service/party
+# screens); Waitwhile ignores date params, so the day can't be preselected.
 CLICK_URL = os.environ.get(
-    "CLICK_URL", f"https://waitwhile.com/locations/{LOCATION_SLUG}"
+    "CLICK_URL",
+    f"https://waitwhile.com/locations/{LOCATION_SLUG}/time?registration=booking",
 )
 # "Personal Shopping" at Chrome Hearts NY West Village
 SERVICE_ID = os.environ.get("SERVICE_ID", "WHmjBONC1Mcf8VSqjWar")
