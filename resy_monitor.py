@@ -18,7 +18,7 @@ import os
 import random
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -28,6 +28,10 @@ VENUE_ID = os.environ.get("RESY_VENUE_ID", "9520")
 VENUE_NAME = os.environ.get("RESY_VENUE_NAME", "Golden Diner")
 PARTY_SIZE = os.environ.get("RESY_PARTY_SIZE", "2")
 DAYS = int(os.environ.get("RESY_DAYS", "30"))
+# Optional inclusive date window ('YYYY-MM-DD'); only openings within
+# it are watched/alerted. Empty = watch the whole DAYS horizon.
+FROM_DATE = date.fromisoformat(f) if (f := os.environ.get("RESY_FROM_DATE", "").strip()) else None
+TO_DATE = date.fromisoformat(t) if (t := os.environ.get("RESY_TO_DATE", "").strip()) else None
 POLL_SECONDS = float(os.environ.get("RESY_POLL_SECONDS", "10"))
 API_KEY = os.environ.get(
     "RESY_API_KEY", "VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5"
@@ -94,15 +98,25 @@ def notify(
     return False
 
 
-def fetch_available_dates(session: requests.Session) -> set:
-    """One calendar check. Returns dates ('2026-07-15') whose
-    reservation inventory is 'available'. Raises on any failure."""
+def watch_range() -> tuple:
+    """(start, end) dates to poll, honoring the FROM/TO window.
+    start > end means there is nothing to watch right now."""
     today = datetime.now(STORE_TZ).date()
+    start = max(today, FROM_DATE) if FROM_DATE else today
+    end = TO_DATE if TO_DATE else today + timedelta(days=DAYS)
+    return start, end
+
+
+def fetch_available_dates(session: requests.Session) -> set:
+    """One calendar check. Returns dates ('2026-07-15') within the
+    watch window whose reservation inventory is 'available'. Raises
+    on any failure."""
+    start, end = watch_range()
     params = {
         "venue_id": VENUE_ID,
         "num_seats": PARTY_SIZE,
-        "start_date": today.isoformat(),
-        "end_date": (today + timedelta(days=DAYS)).isoformat(),
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
     }
     r = session.get(CALENDAR_URL, params=params, timeout=15)
     r.raise_for_status()
@@ -111,6 +125,7 @@ def fetch_available_dates(session: requests.Session) -> set:
         d["date"]
         for d in days
         if d.get("inventory", {}).get("reservation") == "available"
+        and start.isoformat() <= d["date"] <= end.isoformat()
     }
 
 
@@ -194,9 +209,14 @@ def save_found(dates: set) -> None:
 
 
 def main() -> None:
+    window = (
+        f"window {FROM_DATE or 'today'} .. {TO_DATE or f'+{DAYS}d'}"
+        if (FROM_DATE or TO_DATE)
+        else f"next {DAYS} days"
+    )
     log(
         f"Resy watcher starting: {VENUE_NAME} (venue {VENUE_ID}), party of "
-        f"{PARTY_SIZE}, next {DAYS} days, poll every {POLL_SECONDS:g}s, "
+        f"{PARTY_SIZE}, {window}, poll every {POLL_SECONDS:g}s, "
         f"ntfy={'set' if NTFY_TOPIC else 'NOT SET'}"
     )
     session = requests.Session()
@@ -215,9 +235,26 @@ def main() -> None:
     failures_since = None
     error_alerted = False
     backoff = 0.0
+    window_over_notified = False
 
     while True:
         polls += 1
+
+        start, end = watch_range()
+        if start > end:
+            # Window fully in the past (or beyond the horizon): nothing
+            # to poll. Re-check hourly in case the config changes.
+            if TO_DATE and TO_DATE < start and not window_over_notified:
+                log(f"Watch window ended on {TO_DATE}; no more alerts")
+                window_over_notified = notify(
+                    f"{VENUE_NAME} watcher: window ended",
+                    f"The watch window ({FROM_DATE or 'start'} .. {TO_DATE}) "
+                    "has passed. No more alerts will be sent.",
+                    priority="min",
+                )
+            time.sleep(3600)
+            continue
+
         try:
             available = fetch_available_dates(session)
         except Exception as e:
